@@ -35,6 +35,7 @@
   },
   "run": {
     "max_step_retries": 2,
+    "max_transport_retries": 2,
     "check_timeout": 120,
     "context_char_budget": 24000,
     "audit_file_char_budget": 8000,

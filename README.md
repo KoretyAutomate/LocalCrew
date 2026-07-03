@@ -125,6 +125,8 @@ The director decides:
 ```bash
 python3 crew.py propose-skill --workspace ws --step N   # on-demand proposal
 python3 crew.py approve-skill --workspace ws --name n   # promote to .claude/skills
+python3 crew.py approve-skill --workspace ws --name n --attach 1   # ...and attach to
+        # step 1 of plan.json, re-syncing the resume hash — then: run --resume
 python3 crew.py reject-skill  --workspace ws --name n   # delete the staging dir
 ```
 

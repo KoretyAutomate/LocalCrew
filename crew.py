@@ -796,6 +796,7 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None, web_c
         return rec
 
     max_attempts = 1 + rcfg["max_step_retries"]
+    transport_left = rcfg.get("max_transport_retries", 2)
     feedback = None
     passed = False
     for attempt in range(1, max_attempts + 1):
@@ -804,18 +805,28 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None, web_c
             log_event(workspace, {"role": "harness",
                                   "tag": f"step{step['id']}.feedback{attempt - 1}",
                                   "content": feedback})
-        try:
-            messages = build_step_messages(step, context_parts, feedback, skill_parts,
-                                           web_context)
-            tag = f"step{step['id']}.attempt{attempt}"
-            if executor == "manager":
-                raw = call_manager(cfg, messages, cfg["manager"].get("execute_max_tokens", 8192),
-                                   workspace, tag=tag)
-            else:
-                raw = call_intern(cfg, messages, workspace, tag=tag)
-        except LLMError as e:
-            feedback = f"your previous call failed at the transport level: {e}"
-            continue
+        messages = build_step_messages(step, context_parts, feedback, skill_parts,
+                                       web_context)
+        tag = f"step{step['id']}.attempt{attempt}"
+        raw = None
+        while raw is None:
+            # transport failures (timeout, connection) get their own retry budget —
+            # the model never saw anything, so burning an acceptance attempt on them
+            # only shortens the real feedback loop
+            try:
+                if executor == "manager":
+                    raw = call_manager(cfg, messages,
+                                       cfg["manager"].get("execute_max_tokens", 8192),
+                                       workspace, tag=tag)
+                else:
+                    raw = call_intern(cfg, messages, workspace, tag=tag)
+            except LLMError as e:
+                if transport_left <= 0:
+                    rec["reason"] = f"transport failures exhausted retries: {e}"
+                    return rec
+                transport_left -= 1
+                log_event(workspace, {"role": "harness", "tag": f"{tag}.transport_retry",
+                                      "note": str(e)})
         try:
             obj = extract_json(raw)
         except (CrewError, json.JSONDecodeError) as e:
@@ -1346,6 +1357,53 @@ def cmd_approve_skill(args, cfg):
     catalog, _ = discover_skills(cfg, workspace)
     print("now in catalog" if args.name in catalog else
           "WARNING: promoted but not discovered — check skills.dirs config")
+    if args.attach:
+        return attach_skill_to_plan(cfg, workspace, args, catalog)
+    return 0
+
+
+def attach_skill_to_plan(cfg, workspace, args, catalog):
+    """Attach a just-approved skill to plan steps and re-sync the resume hash.
+
+    The plan sha changes by design here — this IS a director-authorized plan edit,
+    so run_state's recorded sha is updated too; --resume keeps working.
+    """
+    if args.name not in catalog:
+        print("cannot --attach: skill not discoverable", file=sys.stderr)
+        return 1
+    plan_path = Path(args.plan) if args.plan else workspace / "plan.json"
+    if not plan_path.is_file():
+        print(f"cannot --attach: no plan at {plan_path}", file=sys.stderr)
+        return 1
+    plan = json.loads(plan_path.read_text())
+    max_per_step = cfg.get("skills", {}).get("max_per_step", 2)
+    by_id = {s["id"]: s for s in plan["steps"]}
+    for sid in args.attach:
+        step = by_id.get(sid)
+        if step is None:
+            print(f"cannot --attach: no step with id {sid}", file=sys.stderr)
+            return 1
+        skills = step.setdefault("skills", [])
+        if args.name in skills:
+            print(f"step {sid}: already attached")
+            continue
+        if len(skills) >= max_per_step:
+            print(f"cannot --attach to step {sid}: already has {len(skills)} skills "
+                  f"(max_per_step={max_per_step})", file=sys.stderr)
+            return 1
+        skills.append(args.name)
+        print(f"step {sid}: attached {args.name}")
+    plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
+    new_sha = file_sha256(plan_path)
+    state_p = state_path(workspace)
+    if state_p.is_file():
+        state = json.loads(state_p.read_text())
+        state["plan_sha"] = new_sha
+        state_p.write_text(json.dumps(state, indent=2))
+        print(f"plan sha updated to {new_sha[:12]}… (run_state re-synced; --resume will work)")
+    else:
+        print(f"plan sha now {new_sha[:12]}…")
+    print(f"next: python3 crew.py run --workspace {workspace} --resume")
     return 0
 
 
@@ -1413,6 +1471,10 @@ def main(argv=None):
     p.add_argument("--workspace", required=True)
     p.add_argument("--name", required=True)
     p.add_argument("--force", action="store_true")
+    p.add_argument("--attach", type=int, action="append",
+                   help="also attach the skill to this plan step (repeatable); "
+                        "updates plan.json and re-syncs run_state for --resume")
+    p.add_argument("--plan", help="plan path for --attach (default: <workspace>/plan.json)")
 
     p = sub.add_parser("reject-skill", help="delete a staged skill proposal")
     p.add_argument("--workspace", required=True)
