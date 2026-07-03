@@ -5,7 +5,8 @@
     "timeout": 600,
     "temperature": 0.2,
     "plan_max_tokens": 8192,
-    "audit_max_tokens": 2048
+    "audit_max_tokens": 2048,
+    "execute_max_tokens": 8192
   },
   "intern": {
     "endpoint": "http://localhost:11434/api/chat",
@@ -14,6 +15,15 @@
     "temperature": 0.1,
     "max_tokens": 8192,
     "num_ctx": 24576
+  },
+  "searxng": {
+    "endpoint": "http://localhost:8080/search",
+    "timeout": 30,
+    "max_results": 5,
+    "page_chars": 4000,
+    "max_queries_per_step": 4,
+    "max_fetch_top": 3,
+    "max_page_bytes": 262144
   },
   "skills": {
     "dirs": ["{workspace}/.claude/skills"],

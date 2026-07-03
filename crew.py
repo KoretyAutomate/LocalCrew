@@ -18,7 +18,10 @@ import shutil
 import subprocess
 import sys
 import time
+import html
+import ipaddress
 import urllib.error
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -74,6 +77,141 @@ def extract_json(text):
     if start == -1 or end <= start:
         raise CrewError("no JSON object found in output")
     return json.loads(text[start : end + 1])
+
+
+# ---------------------------------------------------------------- web research
+
+def url_violation(url):
+    """Guardrail check for fetch_top URLs. Returns a reason string, or None if OK."""
+    try:
+        p = urllib.parse.urlparse(url)
+    except ValueError as e:
+        return f"unparseable URL: {e}"
+    if p.scheme not in ("http", "https"):
+        return f"scheme {p.scheme!r} not allowed"
+    host = p.hostname or ""
+    if not host:
+        return "no host"
+    if host == "localhost":
+        return "localhost blocked"
+    try:
+        ip = ipaddress.ip_address(host)
+        if ip.is_loopback or ip.is_private or ip.is_link_local:
+            return f"private/loopback address {host} blocked"
+    except ValueError:
+        pass  # a hostname, not an IP literal
+    return None
+
+
+class _GuardedRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = 5
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        err = url_violation(newurl)
+        if err:
+            raise CrewError(f"redirect blocked ({err}): {newurl}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def html_to_text(raw):
+    raw = re.sub(r"(?is)<(script|style|noscript)\b.*?</\1>", " ", raw)
+    raw = re.sub(r"(?s)<[^>]+>", " ", raw)
+    return re.sub(r"\s+", " ", html.unescape(raw)).strip()
+
+
+def fetch_page_text(url, sx):
+    """Fetch one external page with guardrails. Returns text, or raises CrewError."""
+    err = url_violation(url)
+    if err:
+        raise CrewError(err)
+    opener = urllib.request.build_opener(_GuardedRedirectHandler)
+    req = urllib.request.Request(url, headers={"User-Agent": "LocalCrew/1.3"})
+    try:
+        with opener.open(req, timeout=sx.get("timeout", 30)) as r:
+            ctype = (r.headers.get("Content-Type") or "").split(";")[0].strip().lower()
+            if ctype and not (ctype.startswith("text/") or ctype == "application/xhtml+xml"):
+                raise CrewError(f"content-type {ctype!r} skipped")
+            raw = r.read(sx.get("max_page_bytes", 262144)).decode("utf-8", errors="replace")
+    except (urllib.error.URLError, OSError, TimeoutError) as e:
+        raise CrewError(str(e)) from e
+    text = html_to_text(raw)
+    if not text:
+        raise CrewError("page produced no text")
+    return text[: sx.get("page_chars", 4000)]
+
+
+def searxng_search(sx, query):
+    """One SearXNG query (retry once). Returns [{title,url,snippet}], or raises CrewError."""
+    qs = urllib.parse.urlencode({"q": query, "format": "json"})
+    url = f"{sx['endpoint']}?{qs}"
+    req = urllib.request.Request(url, headers={"User-Agent": "LocalCrew/1.3"})
+    last = None
+    for attempt in (1, 2):
+        try:
+            with urllib.request.urlopen(req, timeout=sx.get("timeout", 30)) as r:
+                data = json.loads(r.read())
+            results = data.get("results") or []
+            return [{"title": x.get("title") or "(untitled)",
+                     "url": x.get("url") or "",
+                     "snippet": (x.get("content") or "").strip()}
+                    for x in results[: sx.get("max_results", 5)]]
+        except (urllib.error.URLError, OSError, TimeoutError, json.JSONDecodeError) as e:
+            last = e
+            if attempt == 1:
+                time.sleep(2)
+    raise CrewError(f"SearXNG query failed after retry: {last}")
+
+
+def gather_web_context(cfg, workspace, step, cache):
+    """Run a step's web_queries via the harness. Returns (context text, sources list).
+
+    Raises CrewError if search itself is unavailable (fail-fast — never silently
+    research-less). Page-fetch failures degrade to notes. Saves the raw evidence to
+    .crew/web/step_<id>.json.
+    """
+    queries = step.get("web_queries", []) or []
+    if not queries:
+        return "", []
+    sx = cfg.get("searxng") or {}
+    if not searxng_enabled(cfg):
+        raise CrewError("step has web_queries but searxng is not configured")
+    sections, sources, raw_dump = [], [], []
+    for q in queries:
+        query = q["query"].strip()
+        fetch_top = q.get("fetch_top", 0)
+        key = ("q", " ".join(query.lower().split()))
+        if key not in cache:
+            cache[key] = searxng_search(sx, query)
+        results = cache[key]
+        block = f'--- WEB SEARCH: "{query}" ---\n'
+        if not results:
+            block += "(no results for this query — do not invent sources)\n"
+        for i, res in enumerate(results):
+            block += f"[{i+1}] {res['title']}\n    {res['url']}\n    {res['snippet']}\n"
+            sources.append((res["title"], res["url"]))
+        fetched = []
+        for res in results[:fetch_top]:
+            ukey = ("page", res["url"])
+            if ukey not in cache:
+                try:
+                    cache[ukey] = fetch_page_text(res["url"], sx)
+                except CrewError as e:
+                    cache[ukey] = None
+                    log_event(workspace, {"role": "harness", "tag": f"step{step['id']}.webfetch",
+                                          "note": f"fetch skipped {res['url']}: {e}"})
+            if cache[ukey] is None:
+                block += f"\n(fetch failed or blocked: {res['url']})\n"
+            else:
+                block += f"\n--- PAGE TEXT: {res['url']} ---\n{cache[ukey]}\n"
+                fetched.append(res["url"])
+        sections.append(block)
+        raw_dump.append({"query": query, "fetch_top": fetch_top,
+                         "results": results, "fetched": fetched})
+    webdir = crew_dir(workspace) / "web"
+    webdir.mkdir(exist_ok=True)
+    (webdir / f"step_{step['id']}.json").write_text(
+        json.dumps(raw_dump, indent=2, ensure_ascii=False))
+    return "\n".join(sections), sources
 
 
 # ---------------------------------------------------------------- skills
@@ -296,6 +434,33 @@ def validate_plan(plan, cfg, skill_catalog=None):
         for d in s.get("depends_on", []) or []:
             if not isinstance(d, int) or d not in seen or d == sid:
                 errors.append(f"{tag}: depends_on {d!r} must reference an EARLIER step id")
+        if s.get("executor", "intern") not in ("intern", "manager"):
+            errors.append(f"{tag}: executor must be 'intern' or 'manager'")
+        wq = s.get("web_queries", []) or []
+        if not isinstance(wq, list):
+            errors.append(f"{tag}: web_queries must be a list")
+        elif wq:
+            sx = cfg.get("searxng") or {}
+            if not searxng_enabled(cfg):
+                errors.append(f"{tag}: web_queries used but searxng is not configured")
+            elif len(wq) > sx.get("max_queries_per_step", 4):
+                errors.append(f"{tag}: {len(wq)} web queries, max is "
+                              f"{sx.get('max_queries_per_step', 4)}")
+            else:
+                fetch_total = 0
+                for q in wq:
+                    if not isinstance(q, dict) or not isinstance(q.get("query"), str) \
+                            or not q["query"].strip():
+                        errors.append(f"{tag}: each web query needs a non-empty 'query' string")
+                        continue
+                    ft = q.get("fetch_top", 0)
+                    if not isinstance(ft, int) or ft < 0:
+                        errors.append(f"{tag}: fetch_top must be an int >= 0")
+                    else:
+                        fetch_total += ft
+                if fetch_total > sx.get("max_fetch_top", 3):
+                    errors.append(f"{tag}: total fetch_top {fetch_total} exceeds "
+                                  f"max_fetch_top {sx.get('max_fetch_top', 3)}")
         skills = s.get("skills", []) or []
         if not isinstance(skills, list):
             errors.append(f"{tag}: skills must be a list")
@@ -319,9 +484,10 @@ def validate_plan(plan, cfg, skill_catalog=None):
 
 # ---------------------------------------------------------------- prompts
 
-MANAGER_PLAN_SYSTEM = """You are a senior engineering manager writing an implementation plan.
-The plan will be executed step-by-step by a small, literal-minded model that CANNOT ask
-questions, CANNOT see other steps, and rewrites ENTIRE files from scratch.
+MANAGER_PLAN_SYSTEM = """You are a senior manager writing an execution plan. Steps produce
+FILES (code, data, markdown, config). The plan is executed step-by-step by a literal-minded
+model that CANNOT ask questions, CANNOT see other steps, and rewrites ENTIRE files from
+scratch.
 
 Output ONLY a JSON object (no prose, no markdown) with this exact shape:
 {
@@ -331,9 +497,11 @@ Output ONLY a JSON object (no prose, no markdown) with this exact shape:
       "id": 1,
       "title": "short title",
       "depends_on": [],
+      "executor": "intern",
       "target_files": ["relative/path.py"],
       "context_files": [],
       "skills": [],
+      "web_queries": [],
       "instructions": "...",
       "acceptance_checks": ["python3 -c \\"import ast; ast.parse(open('relative/path.py').read())\\""]
     }
@@ -362,26 +530,44 @@ HARD REQUIREMENTS for every step:
   the AVAILABLE SKILLS catalog) ONLY if the step's acceptance depends on conforming to
   it. The full skill text is injected into the executor's prompt and eats its context
   budget — never attach "just in case". If no catalog is shown, always use [].
+- executor: "intern" (DEFAULT — a small fast model) or "manager" (a much stronger but
+  slow model). Use "manager" ONLY for steps that genuinely exceed a small model:
+  multi-constraint synthesis, subtle logic, nuanced prose. Mechanical steps stay intern.
+- For non-code outputs use structural checks: `grep -c <required-marker> <file>`,
+  `python3 -c "import json; json.load(open('data.json'))"`, `ls <file>`.
+{web_section}"""
+
+WEB_PLAN_SECTION = """- web_queries: DEFAULT IS []. Steps MAY request web research: the harness (not you, not
+  the executor) queries a search engine BEFORE the executor runs and injects results
+  (title/URL/snippet, optionally fetched page text) into the executor's prompt.
+  Format: [{"query": "specific search phrase", "fetch_top": 0}] — max {max_q} queries
+  per step; fetch_top > 0 fetches the full text of that many top results (use only when
+  snippets won't suffice; the SUM of fetch_top across one step must be <= {max_f}).
+  Results eat the executor's context budget. Only add queries when the step needs
+  EXTERNAL information; instruct the executor to cite the URLs it used in its output.
 """
 
-INTERN_STEP_SYSTEM = """You are a careful code writer executing ONE implementation step.
-Output ONLY a valid JSON object, no prose, no markdown:
+EXECUTOR_STEP_SYSTEM = """You are a careful worker executing ONE step that produces files
+(code, data, markdown, or config). Output ONLY a valid JSON object, no prose, no markdown:
 {"files": [{"path": "relative/path", "content": "COMPLETE file content"}], "notes": "one line"}
 
 Rules:
 - Write the COMPLETE content of every file you emit (they replace the file entirely).
 - Encode newlines as a single \\n inside the JSON string — NEVER double-escape (\\\\n).
 - You may ONLY write the target files listed in the step. No other paths.
-- No TODOs, no stubs, no placeholders. Follow the instructions exactly.
+- No placeholders or TODOs; when writing code, no stub bodies. Follow the instructions exactly.
+- If WEB SEARCH RESULTS are provided, base factual claims on them and cite source URLs
+  where the instructions ask for citations. Never invent sources.
 - Your work must pass the acceptance checks shown to you.
 """
 
-MANAGER_AUDIT_SYSTEM = """You audit an intern's completed work against the step specification.
+MANAGER_AUDIT_SYSTEM = """You audit an executor's completed files against the step specification.
 Output ONLY a JSON object: {"verdict": "pass" or "fail", "issues": ["..."]}
 
 Fail if the work deviates from the spec, is incomplete, contains placeholders, or is
-clearly incorrect. Minor style differences are NOT a fail. List concrete issues; an
-empty issues list is expected for a pass.
+clearly incorrect. If the spec required citations, fail work whose cited URLs are not
+among the listed web sources. Minor style differences are NOT a fail. List concrete
+issues; an empty issues list is expected for a pass.
 """
 
 
@@ -399,12 +585,23 @@ def workspace_listing(workspace: Path, max_entries=200):
     return "\n".join(lines) or "(empty workspace)"
 
 
+def searxng_enabled(cfg):
+    return bool((cfg.get("searxng") or {}).get("endpoint"))
+
+
 def build_plan_messages(cfg, brief, listing, skill_catalog):
     allowlist = ", ".join(cfg["run"]["allowed_check_binaries"])
     max_skills = str(cfg.get("skills", {}).get("max_per_step", 2))
+    sx = cfg.get("searxng") or {}
+    web_section = ""
+    if searxng_enabled(cfg):
+        web_section = (WEB_PLAN_SECTION
+                       .replace("{max_q}", str(sx.get("max_queries_per_step", 4)))
+                       .replace("{max_f}", str(sx.get("max_fetch_top", 3))))
     system = (MANAGER_PLAN_SYSTEM
               .replace("{allowlist}", allowlist)
-              .replace("{max_skills}", max_skills))
+              .replace("{max_skills}", max_skills)
+              .replace("{web_section}", web_section))
     user = f"TASK BRIEF from the director:\n\n{brief}\n\n"
     if skill_catalog:
         user += "AVAILABLE SKILLS (name — description):\n" + "\n".join(
@@ -431,26 +628,32 @@ def format_skill_sections(skill_parts):
                    for name, body in skill_parts)
 
 
-def build_step_messages(step, context_parts, feedback, skill_parts=()):
+def build_step_messages(step, context_parts, feedback, skill_parts=(), web_context=""):
     ctx = ""
     for rel, text in context_parts:
         ctx += f"\n--- CONTEXT FILE: {rel} ---\n{text}\n"
     user = format_step_spec(step)
     if skill_parts:
         user += "\n\nSKILLS:" + format_skill_sections(skill_parts)
+    if web_context:
+        user += "\n\nWEB SEARCH RESULTS (gathered for you — cite URLs from here only):\n" \
+                + web_context
     if ctx:
         user += "\n\nCONTEXT FILES (current contents):" + ctx
     if feedback:
         user += ("\n\nYOUR PREVIOUS ATTEMPT FAILED. Fix it and output the full JSON again.\n"
                  f"FAILURE DETAILS:\n{feedback}")
-    return [{"role": "system", "content": INTERN_STEP_SYSTEM},
+    return [{"role": "system", "content": EXECUTOR_STEP_SYSTEM},
             {"role": "user", "content": user}]
 
 
-def build_audit_messages(step, file_parts, check_results, skill_parts=()):
+def build_audit_messages(step, file_parts, check_results, skill_parts=(), web_sources=()):
     body = format_step_spec(step)
     if skill_parts:
         body += "\n\nSKILLS THE WORK MUST CONFORM TO:" + format_skill_sections(skill_parts)
+    if web_sources:
+        body += "\n\nWEB SOURCES the executor was given (citations must come from these):\n"
+        body += "\n".join(f"- {t} — {u}" for t, u in web_sources)
     body += "\n\nFINAL FILE CONTENTS:\n"
     for rel, text in file_parts:
         body += f"\n--- {rel} ---\n{text}\n"
@@ -557,12 +760,13 @@ def validate_intern_output(obj, step):
     return files, None
 
 
-def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None):
+def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None, web_cache=None):
     """Run one step end to end. Returns a step record dict (status DONE/FAILED/AUDIT_FAIL)."""
     rcfg = cfg["run"]
-    rec = {"id": step["id"], "title": step["title"], "status": "FAILED",
-           "attempts": 0, "files_written": [], "check_results": [], "audit": None,
-           "reason": None, "started_at": now_iso()}
+    executor = step.get("executor", "intern")
+    rec = {"id": step["id"], "title": step["title"], "executor": executor,
+           "status": "FAILED", "attempts": 0, "files_written": [], "check_results": [],
+           "audit": None, "reason": None, "started_at": now_iso()}
 
     try:
         budget = rcfg["context_char_budget"]
@@ -573,6 +777,9 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None):
                 raise CrewError(f"skill missing from catalog: {n!r} (was it deleted after plan review?)")
             total += len(sk["body"])
             skill_parts.append((n, sk["body"]))
+        web_context, web_sources = gather_web_context(
+            cfg, workspace, step, web_cache if web_cache is not None else {})
+        total += len(web_context)
         context_parts = []
         for rel in step.get("context_files", []) or []:
             p = resolve_in_workspace(workspace, rel)
@@ -582,7 +789,7 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None):
             total += len(text)
             context_parts.append((rel, text))
         if total > budget:
-            raise CrewError(f"context budget exceeded (skills + context files): "
+            raise CrewError(f"context budget exceeded (skills + web + context files): "
                             f"{total} chars > {budget}")
     except CrewError as e:
         rec["reason"] = str(e)
@@ -598,8 +805,14 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None):
                                   "tag": f"step{step['id']}.feedback{attempt - 1}",
                                   "content": feedback})
         try:
-            raw = call_intern(cfg, build_step_messages(step, context_parts, feedback, skill_parts),
-                              workspace, tag=f"step{step['id']}.attempt{attempt}")
+            messages = build_step_messages(step, context_parts, feedback, skill_parts,
+                                           web_context)
+            tag = f"step{step['id']}.attempt{attempt}"
+            if executor == "manager":
+                raw = call_manager(cfg, messages, cfg["manager"].get("execute_max_tokens", 8192),
+                                   workspace, tag=tag)
+            else:
+                raw = call_intern(cfg, messages, workspace, tag=tag)
         except LLMError as e:
             feedback = f"your previous call failed at the transport level: {e}"
             continue
@@ -642,18 +855,30 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None):
         rec["status"] = "DONE"
         rec["audit"] = {"verdict": "skipped", "issues": []}
         return rec
+    if executor == "manager":
+        # a manager self-audit of its own fresh output is near-worthless; the
+        # director reviews manager-executed steps instead (flagged in the report)
+        rec["status"] = "DONE"
+        rec["audit"] = {"verdict": "self_skipped", "issues": []}
+        return rec
 
     rec["audit"] = audit_step(cfg, workspace, step,
                               [(c["cmd"], c["rc"], c["tail"]) for c in rec["check_results"]],
-                              skill_parts)
+                              skill_parts, web_sources)
     rec["status"] = "DONE" if rec["audit"]["verdict"] == "pass" else "AUDIT_FAIL"
     if rec["status"] == "AUDIT_FAIL":
         rec["reason"] = "manager audit failed: " + "; ".join(rec["audit"]["issues"])
     return rec
 
 
-def audit_step(cfg, workspace, step, check_results, skill_parts=()):
+def audit_step(cfg, workspace, step, check_results, skill_parts=(), web_sources=None):
     """Manager audit of a step's current on-disk result. Fail-safe on any error."""
+    if web_sources is None:
+        web_sources = []
+        wf = crew_dir(workspace) / "web" / f"step_{step['id']}.json"
+        if wf.is_file():
+            for q in json.loads(wf.read_text()):
+                web_sources += [(r["title"], r["url"]) for r in q.get("results", [])]
     budget = cfg["run"]["audit_file_char_budget"]
     file_parts = []
     for rel in step["target_files"]:
@@ -663,7 +888,8 @@ def audit_step(cfg, workspace, step, check_results, skill_parts=()):
             text = text[:budget] + f"\n... (truncated at {budget} chars)"
         file_parts.append((rel, text))
     try:
-        raw = call_manager(cfg, build_audit_messages(step, file_parts, check_results, skill_parts),
+        raw = call_manager(cfg, build_audit_messages(step, file_parts, check_results,
+                                                     skill_parts, web_sources),
                            cfg["manager"]["audit_max_tokens"], workspace,
                            tag=f"audit.step{step['id']}")
         obj = extract_json(raw)
@@ -836,6 +1062,10 @@ def write_report(workspace, plan, plan_hash, records, aborted, proposal=None):
     for r in records:
         lines.append(f"| {r['id']} | {r['title']} | **{r['status']}** | "
                      f"{r['attempts']} | {', '.join(r['files_written']) or '-'} |")
+    manager_steps = [r for r in records if r.get("executor") == "manager"]
+    if manager_steps:
+        lines += ["", "**Manager-executed steps (no self-audit ran — director must review "
+                  "these files):** " + ", ".join(f"step {r['id']}" for r in manager_steps)]
     for r in records:
         if r["status"] == "DONE" and not (r["audit"] or {}).get("issues"):
             continue
@@ -865,18 +1095,24 @@ def write_report(workspace, plan, plan_hash, records, aborted, proposal=None):
 
 def cmd_health(args, cfg):
     ok = True
-    for name, fn in [
+    targets = [
         ("manager", lambda: call_manager(
             cfg, [{"role": "user", "content": "Reply with exactly: OK"}], 16, tag="health")),
         ("intern", lambda: call_intern(
             cfg, [{"role": "user", "content": "Reply with exactly: OK"}],
             tag="health", force_json=False)),
-    ]:
+    ]
+    if searxng_enabled(cfg):
+        def _sx_check():
+            if not searxng_search(cfg["searxng"], "test"):
+                raise LLMError("searxng returned zero results for a trivial query")
+        targets.append(("searxng", _sx_check))
+    for name, fn in targets:
         t0 = time.time()
         try:
             fn()
             print(f"{name}: OK ({time.time() - t0:.1f}s)")
-        except LLMError as e:
+        except (LLMError, CrewError) as e:
             print(f"{name}: FAIL — {e}")
             ok = False
     return 0 if ok else 1
@@ -926,13 +1162,15 @@ def cmd_plan(args, cfg):
     print(f"plan sha256: {sha}")
     print(f"task: {plan['task']}")
     for s in plan["steps"]:
-        print(f"  step {s['id']}: {s['title']}")
+        print(f"  step {s['id']}: {s['title']} [{s.get('executor', 'intern')}]")
         print(f"    targets: {', '.join(s['target_files'])}")
         if s.get("context_files"):
             print(f"    context: {', '.join(s['context_files'])}")
         if s.get("skills"):
             print("    skills:  " + ", ".join(
                 f"{n} ({len(catalog[n]['body'])} chars)" for n in s["skills"]))
+        for q in s.get("web_queries", []) or []:
+            print(f"    web:     \"{q['query']}\" (fetch_top={q.get('fetch_top', 0)})")
         print(f"    checks:  {len(s['acceptance_checks'])}")
     print("\nDirector: review the full plan.json before running "
           "(instructions quality decides everything).")
@@ -986,18 +1224,24 @@ def cmd_run(args, cfg):
         print(f"DRY RUN — plan sha256 {plan_hash}")
         for s in selected:
             print(f"step {s['id']}: {s['title']}")
+            print(f"  executor: {s.get('executor', 'intern')}")
             print(f"  targets: {', '.join(s['target_files'])}")
             print(f"  context: {', '.join(s.get('context_files') or []) or '-'}")
             print(f"  skills:  {', '.join(s.get('skills') or []) or '-'}")
+            for q in s.get("web_queries", []) or []:
+                print(f"  web:     \"{q['query']}\" (fetch_top={q.get('fetch_top', 0)})")
             for c in s["acceptance_checks"]:
                 print(f"  check: {c}")
         return 0
 
     log_event(workspace, {"role": "harness", "tag": "run.start", "plan_sha": plan_hash})
     records, aborted = [], False
+    web_cache = {}
     for s in selected:
-        print(f"[{now_iso()}] step {s['id']}: {s['title']} ...", flush=True)
-        rec = execute_step(cfg, workspace, s, no_audit=args.no_audit, skill_catalog=catalog)
+        print(f"[{now_iso()}] step {s['id']}: {s['title']} "
+              f"[{s.get('executor', 'intern')}] ...", flush=True)
+        rec = execute_step(cfg, workspace, s, no_audit=args.no_audit,
+                           skill_catalog=catalog, web_cache=web_cache)
         records.append(rec)
         state["steps"][str(s["id"])] = rec
         save_state(workspace, state)
@@ -1007,7 +1251,9 @@ def cmd_run(args, cfg):
             break
 
     proposal = None
-    problem_ids = {r["id"] for r in records if r["attempts"] > 1 or r["status"] != "DONE"}
+    problem_ids = {r["id"] for r in records
+                   if (r["attempts"] > 1 or r["status"] != "DONE")
+                   and r.get("executor", "intern") == "intern"}
     if problem_ids and cfg.get("skills", {}).get("auto_propose", True):
         problem_steps = [s for s in steps if s["id"] in problem_ids]
         state_recs = {str(r["id"]): r for r in records}
@@ -1042,6 +1288,8 @@ def cmd_audit(args, cfg):
         if rc != 0:
             print(tail)
     audit = audit_step(cfg, workspace, step, results, skill_parts)
+    if step.get("executor") == "manager":
+        print("note: auditor model == executor model for this step; weigh the verdict accordingly")
     print(f"\naudit verdict: {audit['verdict']}")
     for i in audit["issues"]:
         print(f"  - {i}")

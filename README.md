@@ -19,6 +19,47 @@ audits the decomposition ("is the plan sound").
 write the code directly. The hierarchy pays only for mechanical, voluminous work
 (bulk refactors, test generation, applying a pattern across files).
 
+Not code-only: any task that emits **files** with **machine-checkable acceptance**
+qualifies — data files, markdown briefings, config. Use structural checks
+(`grep -c "## Section" out.md`, `python3 -c "import json; json.load(open('x.json'))"`)
+for non-code outputs. The looser the checks, the more weight falls on audits and
+director review.
+
+## Executor tiers
+
+Each step carries `"executor": "intern" | "manager"` (default intern). The decision
+ladder: **intern** for mechanical, well-specified steps; **manager** for steps needing
+real judgment (multi-constraint synthesis, conflicting sources, subtle logic) that are
+still too voluminous to keep upstairs; **the director writes it directly** when the
+plan would be as long as the output. Manager-executed steps skip the manager audit
+(self-review is near-worthless) — the report flags them **"director must review"**
+instead, so the human/Claude gate replaces the model gate.
+
+## Web research (SearXNG, harness-run)
+
+The models stay tool-less; the **harness** runs searches. Steps may declare
+
+```json
+"web_queries": [{"query": "kv cache quantization fp8", "fetch_top": 2}]
+```
+
+Before the executor runs, the harness queries SearXNG (`searxng.endpoint` in config;
+delete/empty to disable), injects top results (title/URL/snippet) and — for
+`fetch_top` — full page text (HTML-stripped, truncated) into the executor's prompt.
+Results count against the context budget; the raw evidence is saved to
+`.crew/web/step_<N>.json`; the audit gets the source list so citation claims are
+checkable. Search failure fails the step *before* the LLM call — never silently
+research-less. Fetches of result URLs are guarded (http/https only, no
+loopback/private hosts, bounded reads, text content-types, capped redirects).
+
+Patterns that work well:
+- **Research brief**: web_queries + a synthesis step (usually `executor: manager`)
+  producing a structured .md with a required `## Sources` section, checked via `grep -c`.
+- **Map-reduce over files**: N steps each reading a chunk via `context_files` and
+  emitting `findings/<n>.json`, plus a final aggregation step. Bulk extraction and
+  classification over a *known* file set is the crew's sweet spot; interactive
+  "find where/why X" exploration is not — that needs tools the executors don't have.
+
 ## Requirements
 
 - Python 3 (stdlib only — no pip installs)
