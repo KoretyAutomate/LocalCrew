@@ -72,6 +72,7 @@ Endpoints, models, timeouts, token budgets and the check-binary allowlist live i
 ## Usage
 
 ```bash
+python3 crew.py stats                                 # usage + success rates (global ledger)
 python3 crew.py health                                # both endpoints answering?
 
 python3 crew.py plan --brief brief.md --workspace ws/ # manager writes ws/plan.json
@@ -146,6 +147,13 @@ self-approves; a proposal-call failure never changes the run's exit status.
    allowlisted binaries). Failures feed stderr back to the intern (max 2 retries).
 6. Manager audits the result against the step spec; a `fail` verdict stops the run.
    An unparseable audit is treated as a fail (fail-safe).
+
+## Usage ledger
+
+Every `run` appends one JSONL record (workspace, task, per-step status/attempts/executor,
+outcome, skill proposal) to `run.ledger` — default `~/.localcrew/ledger.jsonl`, empty
+string disables. `crew.py stats [--last N]` aggregates run/step success rates and a
+per-executor breakdown. Ledger writes never fail a run.
 
 ## Workspace artifacts
 

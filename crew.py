@@ -1102,6 +1102,69 @@ def write_report(workspace, plan, plan_hash, records, aborted, proposal=None):
     return path
 
 
+# ---------------------------------------------------------------- ledger
+
+def ledger_path(cfg):
+    p = cfg.get("run", {}).get("ledger", "")
+    return Path(p).expanduser() if p else None
+
+
+def append_ledger(cfg, record):
+    """Append one run record to the global ledger. Never fails the run."""
+    path = ledger_path(cfg)
+    if path is None:
+        return
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a") as f:
+            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+    except OSError as e:
+        print(f"warning: ledger write failed: {e}", file=sys.stderr)
+
+
+def cmd_stats(args, cfg):
+    path = ledger_path(cfg)
+    if path is None or not path.is_file():
+        print(f"no ledger yet ({path or 'ledger disabled in config'})")
+        return 0
+    runs = []
+    for line in path.read_text().splitlines():
+        try:
+            runs.append(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    if not runs:
+        print("ledger is empty")
+        return 0
+    completed = sum(1 for r in runs if r["outcome"] == "completed")
+    steps = [s for r in runs for s in r["steps"]]
+    done = [s for s in steps if s["status"] == "DONE"]
+    first_try = [s for s in done if s.get("attempts") == 1]
+    print(f"runs: {len(runs)} total, {completed} completed, "
+          f"{len(runs) - completed} aborted "
+          f"({100 * completed // len(runs)}% run success)")
+    if steps:
+        print(f"steps: {len(steps)} total, {len(done)} DONE "
+              f"({100 * len(done) // len(steps)}%), "
+              f"{len(first_try)} first-attempt ({100 * len(first_try) // max(len(done), 1)}% of DONE)")
+    by_exec = {}
+    for s in steps:
+        e = s.get("executor", "intern")
+        by_exec.setdefault(e, [0, 0])[1] += 1
+        if s["status"] == "DONE":
+            by_exec[e][0] += 1
+    for e, (d, t) in sorted(by_exec.items()):
+        print(f"  {e}: {d}/{t} steps DONE")
+    print()
+    for r in runs[-args.last:]:
+        marks = " ".join(f"{s['id']}:{s['status']}({s['attempts']})" for s in r["steps"])
+        flags = " [backfilled]" if r.get("backfilled") else ""
+        print(f"{r['ts'][:16]}  {r['outcome']:9}  {Path(r['workspace']).name:20}  "
+              f"{marks}{flags}")
+        print(f"                 {r['task'][:90]}")
+    return 0
+
+
 # ---------------------------------------------------------------- commands
 
 def cmd_health(args, cfg):
@@ -1274,6 +1337,14 @@ def cmd_run(args, cfg):
             print(f"skill proposal staged: {proposal[0]} — "
                   f"cat {crew_dir(workspace) / 'skill_proposals' / proposal[0] / 'SKILL.md'}")
 
+    append_ledger(cfg, {
+        "ts": now_iso(), "workspace": str(workspace.resolve()),
+        "task": plan["task"], "plan_sha": plan_hash,
+        "outcome": "aborted" if aborted else "completed",
+        "steps": [{"id": r["id"], "status": r["status"], "attempts": r["attempts"],
+                   "executor": r.get("executor", "intern")} for r in records],
+        "skill_proposal": proposal[0] if proposal else None,
+    })
     report = write_report(workspace, plan, plan_hash, records, aborted, proposal)
     print(f"\nreport: {report}")
     print(f"log:    {crew_dir(workspace) / 'run_log.jsonl'}")
@@ -1441,6 +1512,9 @@ def main(argv=None):
 
     sub.add_parser("health", help="verify both LLM endpoints respond")
 
+    p = sub.add_parser("stats", help="usage + success-rate summary from the global ledger")
+    p.add_argument("--last", type=int, default=10, help="show the last N runs (default 10)")
+
     p = sub.add_parser("skills", help="list skills discoverable by the crew")
     p.add_argument("--workspace")
 
@@ -1484,7 +1558,7 @@ def main(argv=None):
     cfg = load_config(args.config)
     try:
         return {"health": cmd_health, "plan": cmd_plan, "run": cmd_run,
-                "audit": cmd_audit, "skills": cmd_skills,
+                "audit": cmd_audit, "skills": cmd_skills, "stats": cmd_stats,
                 "propose-skill": cmd_propose_skill,
                 "approve-skill": cmd_approve_skill,
                 "reject-skill": cmd_reject_skill}[args.cmd](args, cfg)
