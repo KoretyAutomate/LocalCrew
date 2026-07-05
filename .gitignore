@@ -3,3 +3,4 @@ __pycache__/
 .crew/
 PLAN.md
 test_results/
+config.local.json

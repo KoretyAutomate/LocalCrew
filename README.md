@@ -148,6 +148,33 @@ self-approves; a proposal-call failure never changes the run's exit status.
 6. Manager audits the result against the step spec; a `fail` verdict stops the run.
    An unparseable audit is treated as a fail (fail-safe).
 
+## Intake pre-check (Claude Code hook)
+
+The delegation decision is easiest to miss at task intake — once the director starts
+planning, it plans for itself as executor. `hooks/precheck.py` is a Claude Code
+**UserPromptSubmit** hook that regex-scans each prompt for delegable-work signals
+(task-class AND bulk-scale, or a standalone strong signal like a research brief;
+English + Japanese) and injects a one-line advisory *before the model sees the
+prompt*. Advisory-only: false positives are expected and the director still decides.
+
+Register it in `~/.claude/settings.json`:
+
+```json
+"UserPromptSubmit": [{"hooks": [{"type": "command",
+  "command": "python3 /path/to/LocalCrew/hooks/precheck.py"}]}]
+```
+
+- **Fail-safe**: any error → exit 0, silent — a broken pre-check must never block a
+  prompt. Because that hides breakage, `precheck.py --selftest` runs canned prompts
+  and prints verdicts.
+- Config: `precheck` block in `config.json`, overridable via an untracked
+  `config.local.json` (same shape; hook-only) so per-machine tweaks don't dirty the
+  tree. `advisory_hint` customizes the injected guidance text.
+- Optional `llm_escalation` asks the intern model yes/no against the decision test
+  and suppresses the advisory on "no" (fails open on any error). **Default off**: in
+  live testing qwen3:8b judged a clearly delegable bulk-refactor prompt not-delegable
+  — 8B false negatives would hide correct advisories. Heuristics are the gate.
+
 ## Usage ledger
 
 Every `run` appends one JSONL record (workspace, task, per-step status/attempts/executor,

@@ -33,6 +33,15 @@
     "propose_attempt_chars": 2500,
     "propose_max_tokens": 4096
   },
+  "precheck": {
+    "enabled": true,
+    "min_prompt_chars": 40,
+    "cjk_min_prompt_chars": 10,
+    "scan_chars": 2000,
+    "llm_escalation": false,
+    "llm_timeout": 5,
+    "advisory_hint": "Before planning or writing code, run the LocalCrew delegation decision test (machine-checkable acceptance + mechanical/bounded synthesis + voluminous) and record the outcome."
+  },
   "run": {
     "ledger": "~/.localcrew/ledger.jsonl",
     "max_step_retries": 2,
