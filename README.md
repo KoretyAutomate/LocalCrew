@@ -69,6 +69,28 @@ Patterns that work well:
 Endpoints, models, timeouts, token budgets and the check-binary allowlist live in
 `config.json`.
 
+## MCP server (recommended for Claude Code)
+
+`mcp_server.py` wraps crew.py as MCP tools so the crew sits in the assistant's
+per-turn tool list instead of being a CLI it must remember:
+
+```bash
+claude mcp add --scope user localcrew -- python3 /path/to/LocalCrew/mcp_server.py
+```
+
+Tools: `crew_stats`, `crew_health`, `crew_skills`, `crew_plan`, `crew_run`,
+`crew_run_status`. `crew_run` starts the run **detached** and returns
+immediately (console log in `<ws>/.crew/run_console.log`; poll
+`crew_run_status`) — an MCP call never blocks for the minutes a run takes.
+`env_path_prepend` prepends a directory to PATH so acceptance checks resolve
+the project's `python3`/`pytest` (e.g. a conda env's bin) — the check allowlist
+is exact-token and rejects absolute paths, so PATH is the sanctioned route.
+The wrapper adds no logic and no auto-approval: plan review and independent
+verification stay with the director. Stdlib-only, stdio transport.
+
+Fill-in-the-blank brief templates live in `examples/briefs/` (test generation,
+bulk refactor, map-reduce extraction, research brief).
+
 ## Usage
 
 ```bash
