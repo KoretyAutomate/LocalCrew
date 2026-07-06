@@ -156,6 +156,23 @@ python3 crew.py reject-skill  --workspace ws --name n   # delete the staging dir
 `run_report.md` lists pending proposals with paste-ready commands. The tool never
 self-approves; a proposal-call failure never changes the run's exit status.
 
+## Pre-flight validation (v1.6)
+
+Plans are checked for deterministic dooms before any model runs:
+
+- **Context budget**: each step's existing context files + attached skill bodies
+  must fit `context_char_budget`. Violations reject the plan at `plan` time (the
+  manager gets the errors as retry feedback) and refuse `run` at startup;
+  `approve-skill --attach` warns when an attachment pushes a step over. Files
+  created by earlier steps are exempt (size unknown until run time).
+- **Truncation awareness**: when a backend reports it hit the output token limit
+  (`done_reason`/`finish_reason == "length"`), retry feedback says so explicitly
+  and asks for shorter output — a truncated file otherwise masquerades as a
+  syntax error that retries can never fix.
+- **No unverified facts**: the planning prompt forbids schema/signature claims
+  that aren't grounded in the brief or a context file. The harness can't check
+  facts for you: grep-verify DDL and signatures before they enter a brief.
+
 ## Per-step execution loop
 
 1. Gather `context_files` (missing file or blown char budget fails the step *before* any

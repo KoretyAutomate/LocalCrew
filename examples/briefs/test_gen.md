@@ -5,7 +5,12 @@ change any source file; emit test files only.
 
 ## Targets
 
-For each unit under test, list (the plan cannot be more precise than this):
+For each unit under test, list (the plan cannot be more precise than this).
+EVERY signature, table name, and DDL below must be VERIFIED against the source
+(grep the function def; PRAGMA/read the migration) before it enters this brief
+— a wrong "fact" here is unfixable by executor retries. If tests must seed a
+database, paste the exact DDL here or ensure the schema-defining file is small
+enough to ride along as step context.
 
 - `<package/module.py>` — function `<name>(<exact signature>)`:
   <2-3 sentences: what it does, key branches, error behavior>.

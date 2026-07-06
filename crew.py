@@ -295,6 +295,15 @@ def _post(url, body, timeout):
         raise LLMError(f"call to {url} failed: {e}") from e
 
 
+class LLMText(str):
+    """A str that carries whether the generation hit the output token limit.
+
+    Callers that ignore the flag see a plain string; retry loops use it to give
+    truncation-specific feedback (retrying the same length can never succeed).
+    """
+    truncated = False
+
+
 def call_manager(cfg, messages, max_tokens, workspace=None, tag=""):
     m = cfg["manager"]
     body = {
@@ -317,7 +326,9 @@ def call_manager(cfg, messages, max_tokens, workspace=None, tag=""):
     if not content or not content.strip():
         raise LLMError(f"manager returned empty content (tag={tag}, "
                        f"finish_reason={choice.get('finish_reason')})")
-    return content
+    out = LLMText(content)
+    out.truncated = choice.get("finish_reason") == "length"
+    return out
 
 
 def call_intern(cfg, messages, workspace=None, tag="", force_json=True):
@@ -347,7 +358,9 @@ def call_intern(cfg, messages, workspace=None, tag="", force_json=True):
     if not content or not content.strip():
         raise LLMError(f"intern returned empty content (tag={tag}, "
                        f"done_reason={resp.get('done_reason')})")
-    return content
+    out = LLMText(content)
+    out.truncated = resp.get("done_reason") == "length"
+    return out
 
 
 # ---------------------------------------------------------------- validation
@@ -395,12 +408,41 @@ def validate_check_command(cmd, allowed):
     return None
 
 
-def validate_plan(plan, cfg, skill_catalog=None):
-    """Return a list of validation errors (empty list = valid)."""
+def step_context_chars(step, workspace, skill_catalog):
+    """(existing_chars, missing_files): size of a step's context that exists NOW.
+
+    Files a prior step will create are counted as missing, not as errors —
+    their size is unknowable before the run. Skills always count (bodies are
+    in the catalog). Web results are budgeted at run time only.
+    """
+    existing, missing = 0, []
+    for rel in step.get("context_files", []) or []:
+        if not is_safe_relpath(rel):
+            continue  # reported separately by path validation
+        p = Path(workspace) / rel
+        if p.is_file():
+            existing += p.stat().st_size
+        else:
+            missing.append(rel)
+    for n in step.get("skills", []) or []:
+        sk = (skill_catalog or {}).get(n)
+        if sk:
+            existing += len(sk["body"])
+    return existing, missing
+
+
+def validate_plan(plan, cfg, skill_catalog=None, workspace=None):
+    """Return a list of validation errors (empty list = valid).
+
+    With a workspace, also enforces the per-step context budget for files that
+    already exist — every over-budget step is deterministic doom at run time,
+    so failing at plan/validate time is strictly cheaper (2026-07-05: three
+    aborts in one evening traced to unchecked context arithmetic)."""
     errors = []
     allowed = set(cfg["run"]["allowed_check_binaries"])
     skill_catalog = skill_catalog or {}
     max_skills = cfg.get("skills", {}).get("max_per_step", 2)
+    ctx_budget = cfg["run"].get("context_char_budget", 24000)
     if not isinstance(plan.get("task"), str) or not plan["task"].strip():
         errors.append("plan.task must be a non-empty string")
     steps = plan.get("steps")
@@ -479,6 +521,14 @@ def validate_plan(plan, cfg, skill_catalog=None):
                 err = validate_check_command(c, allowed)
                 if err:
                     errors.append(f"{tag}: bad check {c!r}: {err}")
+        if workspace is not None:
+            sz, _missing = step_context_chars(s, workspace, skill_catalog)
+            if sz > ctx_budget:
+                errors.append(
+                    f"{tag}: context too large: existing context_files + attached "
+                    f"skills = {sz} chars > budget {ctx_budget}. Remove files from "
+                    f"context_files (keep only what the executor must SEE; restate "
+                    f"key signatures/DDL in instructions instead) or split the step.")
     return errors
 
 
@@ -522,6 +572,15 @@ HARD REQUIREMENTS for every step:
 - target_files is EXHAUSTIVE: the executor may write only those paths. Tests count.
 - context_files must list every file the executor needs to see, INCLUDING files created
   by earlier steps that this step imports or modifies.
+- CONTEXT BUDGET: each step's context_files + attached skills must total under
+  {ctx_budget} characters (the harness enforces this and fails the step). Prefer the ONE
+  authoritative source file over several; when a file is too large, restate the exact
+  needed interfaces in the instructions instead of attaching it.
+- NO UNVERIFIED FACTS: any table name, schema/DDL, function signature, or flag you write
+  into instructions must come from the brief or a context file — never from memory. If
+  tests must seed a database, either include the schema-defining source in context_files
+  or the brief must contain the exact DDL. A wrong "fact" in instructions is unfixable
+  by retries: the executor will faithfully implement the error.
 - acceptance_checks are shell commands run from the workspace root WITHOUT a shell:
   no pipes, no redirects, no ;, no &&. Allowed binaries: {allowlist}.
   Use python3 -c for syntax/import checks and python3 -m pytest <file> -q for tests.
@@ -601,6 +660,7 @@ def build_plan_messages(cfg, brief, listing, skill_catalog):
     system = (MANAGER_PLAN_SYSTEM
               .replace("{allowlist}", allowlist)
               .replace("{max_skills}", max_skills)
+              .replace("{ctx_budget}", str(cfg["run"].get("context_char_budget", 24000)))
               .replace("{web_section}", web_section))
     user = f"TASK BRIEF from the director:\n\n{brief}\n\n"
     if skill_catalog:
@@ -827,14 +887,26 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None, web_c
                 transport_left -= 1
                 log_event(workspace, {"role": "harness", "tag": f"{tag}.transport_retry",
                                       "note": str(e)})
+        # truncated output is a budget problem, not a comprehension problem —
+        # without this hint the executor retries the same length forever
+        # (2026-07-05: three attempts burned on one truncated test file)
+        trunc_hint = ""
+        if getattr(raw, "truncated", False):
+            log_event(workspace, {"role": "harness", "tag": f"{tag}.truncated",
+                                  "note": "output hit the token limit"})
+            trunc_hint = ("\nYOUR OUTPUT WAS TRUNCATED at the output token limit. "
+                          "Emit substantially SHORTER content (fewer cases, more "
+                          "compact code) — resending the same length will be cut "
+                          "off again.")
         try:
             obj = extract_json(raw)
         except (CrewError, json.JSONDecodeError) as e:
-            feedback = f"your output was not valid JSON ({e}); output ONLY the JSON object"
+            feedback = (f"your output was not valid JSON ({e}); output ONLY the "
+                        f"JSON object{trunc_hint}")
             continue
         files, err = validate_intern_output(obj, step)
         if err:
-            feedback = err
+            feedback = err + trunc_hint
             continue
 
         backup_targets(workspace, step)
@@ -856,7 +928,7 @@ def execute_step(cfg, workspace, step, no_audit=False, skill_catalog=None, web_c
             passed = True
             break
         feedback = "acceptance checks failed:\n" + "\n".join(
-            f"$ {c}\n(exit {rc})\n{t}" for c, rc, t in results if rc != 0)
+            f"$ {c}\n(exit {rc})\n{t}" for c, rc, t in results if rc != 0) + trunc_hint
 
     if not passed:
         rec["reason"] = f"exhausted {max_attempts} attempts; last feedback:\n{feedback}"
@@ -1208,7 +1280,7 @@ def cmd_plan(args, cfg):
                            workspace, tag=f"plan.attempt{attempt}")
         try:
             plan = extract_json(raw)
-            errors = validate_plan(plan, cfg, catalog)
+            errors = validate_plan(plan, cfg, catalog, workspace=workspace)
         except (CrewError, json.JSONDecodeError) as e:
             plan, errors = None, [f"output was not valid JSON: {e}"]
         if not errors:
@@ -1235,11 +1307,15 @@ def cmd_plan(args, cfg):
     print(f"PLAN OK -> {out}")
     print(f"plan sha256: {sha}")
     print(f"task: {plan['task']}")
+    ctx_budget = cfg["run"].get("context_char_budget", 24000)
     for s in plan["steps"]:
         print(f"  step {s['id']}: {s['title']} [{s.get('executor', 'intern')}]")
         print(f"    targets: {', '.join(s['target_files'])}")
         if s.get("context_files"):
+            sz, missing = step_context_chars(s, workspace, catalog)
+            note = f" (+{len(missing)} created by earlier steps)" if missing else ""
             print(f"    context: {', '.join(s['context_files'])}")
+            print(f"             {sz}/{ctx_budget} chars{note}")
         if s.get("skills"):
             print("    skills:  " + ", ".join(
                 f"{n} ({len(catalog[n]['body'])} chars)" for n in s["skills"]))
@@ -1261,7 +1337,7 @@ def cmd_run(args, cfg):
     catalog, warnings = discover_skills(cfg, workspace)
     for w in warnings:
         print(f"skill warning: {w}", file=sys.stderr)
-    errors = validate_plan(plan, cfg, catalog)
+    errors = validate_plan(plan, cfg, catalog, workspace=workspace)
     if errors:
         print("plan fails validation; refusing to run:", file=sys.stderr)
         for e in errors:
@@ -1464,6 +1540,13 @@ def attach_skill_to_plan(cfg, workspace, args, catalog):
             return 1
         skills.append(args.name)
         print(f"step {sid}: attached {args.name}")
+        sz, _ = step_context_chars(step, workspace, catalog)
+        ctx_budget = cfg["run"].get("context_char_budget", 24000)
+        if sz > ctx_budget:
+            print(f"WARNING step {sid}: context is now {sz} chars > budget {ctx_budget} — "
+                  f"the resume WILL fail pre-LLM. Remove a file from its context_files "
+                  f"first (2026-07-05: a skill attach doomed a resume exactly this way).",
+                  file=sys.stderr)
     plan_path.write_text(json.dumps(plan, indent=2, ensure_ascii=False) + "\n")
     new_sha = file_sha256(plan_path)
     state_p = state_path(workspace)
