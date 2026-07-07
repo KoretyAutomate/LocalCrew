@@ -154,7 +154,7 @@ def escalate(cfg, pre, prompt):
     if not endpoint:
         return None
     body = json.dumps({
-        "model": intern.get("model", "qwen3:8b"),
+        "model": intern.get("model", "qwen3.5:9b"),
         "messages": [
             {"role": "system", "content": RUBRIC},
             {"role": "user", "content": prompt[:2000]},

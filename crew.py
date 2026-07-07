@@ -3,7 +3,7 @@
 
 Roles:
   manager  Qwen3.5-122B via vLLM   — expands a brief into a concrete plan; audits results
-  intern   qwen3:8b via Ollama     — executes one plan step at a time (full-file writes)
+  intern   qwen3.5:9b via Ollama     — executes one plan step at a time (full-file writes)
   director the human + Claude Code — reviews the plan, approves the run report
 
 Stdlib only. See PLAN.md for the full design.

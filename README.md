@@ -5,7 +5,7 @@ Delegate well-specified coding work to **local LLMs**, with quality gates at eve
 ```
 director (you + Claude Code)   — writes the brief, reviews the plan, approves the report
 manager  (Qwen3.5-122B, vLLM)  — expands the brief into a concrete step plan; audits results
-intern   (qwen3:8b, Ollama)    — executes one step at a time, emitting full files
+intern   (qwen3.5:9b, Ollama)    — executes one step at a time, emitting full files
 ```
 
 The economics: a plan detailed enough for an 8B executor is verbose but *cheap to review*.
